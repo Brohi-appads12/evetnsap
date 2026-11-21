@@ -1,0 +1,126 @@
+
+name: SofaScore Data Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sofascore-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      SOFASCORE_STORAGE__DATA_DIR: ${{ github.workspace }}/sofascore-data
+
+    steps:
+      - name: Checkout your repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore previous scraper database
+        uses: actions/cache@v4
+        with:
+          path: sofascore-data
+          key: sofascore-data-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            sofascore-data-${{ runner.os }}-
+
+      - name: Install SofaScore Scraper
+        run: |
+          git clone --depth 1 https://github.com/tunjayoff/sofascore_scraper.git /tmp/sofascore_scraper
+          cd /tmp/sofascore_scraper
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -c constraints.txt
+          pip install -e .
+          python -m patchright install --with-deps chromium --no-shell
+
+      - name: Create scraper configuration
+        run: |
+          cat > /tmp/sofascore_scraper/sofascore.toml <<'EOF'
+          [client]
+          rate = 2
+
+          [defaults]
+          slices = ["core"]
+
+          [[follow]]
+          tournament = 17
+          name = "Premier League"
+          sport = "football"
+          seasons = "last:2"
+          live = true
+
+          [[follow]]
+          tournament = 7
+          name = "Champions League"
+          sport = "football"
+          seasons = "last:2"
+          live = true
+
+          [[follow]]
+          tournament = 8
+          name = "La Liga"
+          sport = "football"
+          seasons = "last:2"
+          live = true
+
+          [[follow]]
+          tournament = 23
+          name = "Serie A"
+          sport = "football"
+          seasons = "last:2"
+          live = true
+          EOF
+
+      - name: Validate configuration
+        working-directory: /tmp/sofascore_scraper
+        run: ssc config validate
+
+      - name: Check scraper
+        working-directory: /tmp/sofascore_scraper
+        run: ssc doctor
+
+      - name: Sync football data
+        working-directory: /tmp/sofascore_scraper
+        run: ssc sync
+
+      - name: Export data
+        working-directory: /tmp/sofascore_scraper
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/public"
+          ssc export --dataset events --format jsonl \
+            --out "$GITHUB_WORKSPACE/public/events.jsonl"
+          test -s "$GITHUB_WORKSPACE/public/events.jsonl"
+
+      - name: Upload data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sofascore-events
+          path: public/events.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save data to GitHub repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/events.jsonl
+          if git diff --cached --quiet; then
+            echo "No data changes."
+          else
+            git commit -m "Update SofaScore football data"
+            git push
+          fi
